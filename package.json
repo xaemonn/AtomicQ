@@ -1,0 +1,40 @@
+{
+  "name": "atomicq",
+  "version": "1.0.0",
+  "description": "AtomicQ — a Redis-backed job queue engine built from scratch: atomic Lua state transitions, worker concurrency, stall recovery, rate limiting, cron jobs and a real-time dashboard.",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "nodemon --watch src --ext ts,lua --exec ts-node src/server.ts",
+    "dev:dashboard": "npm --prefix dashboard run dev",
+    "dev:all": "concurrently -n api,ui -c blue,green \"npm run dev\" \"npm run dev:dashboard\"",
+    "build": "tsc && node -e \"require('fs').cpSync('src/lua','dist/lua',{recursive:true})\"",
+    "build:dashboard": "npm --prefix dashboard run build",
+    "build:all": "npm run build && npm run build:dashboard",
+    "start": "node dist/server.js",
+    "test": "jest",
+    "loadtest": "ts-node -r dotenv/config scripts/loadTest.ts"
+  },
+  "dependencies": {
+    "@types/express": "^5.0.6",
+    "@types/socket.io": "^3.0.1",
+    "@types/uuid": "^10.0.0",
+    "cron-parser": "^5.5.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "ioredis": "^5.10.1",
+    "socket.io": "^4.8.3",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^25.5.0",
+    "concurrently": "^9.2.1",
+    "jest": "^30.3.0",
+    "nodemon": "^3.1.14",
+    "testcontainers": "^11.13.0",
+    "ts-jest": "^29.4.6",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.2"
+  }
+}
