@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-ink-950 font-sans text-slate-300 antialiased;
+    /* Teal glow in the corner over a faint dot grid */
+    background-image:
+      radial-gradient(56rem 28rem at 0% -10%, rgba(94, 234, 212, 0.08), transparent 60%),
+      radial-gradient(rgba(148, 163, 184, 0.06) 1px, transparent 1px);
+    background-size: auto, 22px 22px;
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: rgba(94, 234, 212, 0.28);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #2a3344 transparent;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-xl border border-white/[0.07] bg-ink-900/80;
+  }
+
+  .panel-head {
+    @apply flex min-h-[44px] items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-2;
+  }
+
+  .label {
+    @apply text-[11px] font-medium uppercase tracking-[0.14em] text-slate-500;
+  }
+
+  .num {
+    @apply font-mono tabular-nums;
+  }
+
+  .btn {
+    @apply inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-white/10 bg-white/[0.03] px-3 text-xs font-medium text-slate-300 transition-colors hover:border-white/20 hover:bg-white/[0.07] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-atom/60 disabled:pointer-events-none disabled:opacity-40;
+  }
+
+  .btn-primary {
+    @apply border-atom/40 bg-atom/10 text-atom hover:border-atom/70 hover:bg-atom/20 hover:text-atom;
+  }
+
+  .btn-danger {
+    @apply border-rose-400/30 bg-rose-400/10 text-rose-300 hover:border-rose-400/60 hover:bg-rose-400/20 hover:text-rose-200;
+  }
+
+  .btn-icon {
+    @apply w-8 justify-center px-0;
+  }
+
+  .field {
+    @apply h-9 w-full rounded-md border border-white/10 bg-ink-950/60 px-3 text-sm text-slate-200 placeholder:text-slate-600 focus:border-atom/50 focus:outline-none focus:ring-1 focus:ring-atom/40;
+  }
+}
