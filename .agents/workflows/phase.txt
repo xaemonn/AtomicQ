@@ -1,0 +1,1022 @@
+# AtomicQ — Job Queue Engine From Scratch
+
+> **Goal:** Build a production-grade job queue engine from scratch using Node.js + TypeScript + Redis — with worker concurrency, stall detection, Lua atomic scripts, rate limiting, and a real-time [Socket.IO](http://Socket.IO) dashboard. Zero shortcuts. Every tradeoff understood from first principles.
+>
+
+---
+
+# 🧠 What This Engine Does
+
+A job queue engine accepts jobs from producers, stores them durably in Redis, and distributes them to workers reliably — even when workers crash, Redis restarts, or the system is hammered with 10,000 jobs at once. This is the internals of what BullMQ, Sidekiq, and Celery are built on.
+
+Companies like Shopify, GitHub, and Stripe run millions of background jobs daily. Understanding this at the implementation level is a rare skill that almost no fresher has.
+
+---
+
+# 🏗️ Architecture Overview
+
+```
+Producer (your app)
+     ↓ queue.add('send-email', data)
+[Redis Sorted Set — waiting]
+     ↓ Scheduler polls every 500ms
+[Redis Hash — active] ← Worker locks job here
+     ↓ Worker processes
+[Redis Hash — completed] or [Redis Sorted Set — failed/DLQ]
+     ↑
+Watchdog scans active every 10s → stale heartbeat → move back to waiting
+     ↑
+Dashboard subscribes to Redis Pub/Sub → Socket.IO → Real-time UI
+```
+
+---
+
+# ⚙️ Tech Stack
+
+| Layer | Technology | Why |
+| --- | --- | --- |
+| Runtime | Node.js v20 + TypeScript | Your stack, strong typing for complex state |
+| Redis Client | ioredis | Lua script support via defineCommand() |
+| Atomic Ops | Lua scripts | Multi-step Redis ops without race conditions |
+| Concurrency | Semaphore pattern | Gate how many jobs run simultaneously |
+| Real-time | [Socket.IO](http://Socket.IO) | Push job events to dashboard |
+| Dashboard | HTML + Vanilla JS | No framework needed for simple UI |
+| Testing | Jest + Testcontainers | Real Redis in tests, not mocks |
+| Infra | Docker Compose | Redis + 3 worker replicas |
+
+---
+
+# 📁 Folder Structure
+
+```
+src/
+  Queue.ts          ← add(), getJob(), getMetrics()
+  Worker.ts         ← process(), concurrency control, heartbeat
+  Scheduler.ts      ← promotes delayed jobs, handles cron
+  Watchdog.ts       ← stall detection, crash recovery
+  scripts/          ← Lua scripts for atomic ops
+    enqueue.lua
+    moveToActive.lua
+    moveToFailed.lua
+  dashboard/
+    server.ts       ← WebSocket + REST
+    index.html      ← real-time UI
+docker-compose.yml
+```
+
+---
+
+# 📋 50 Phases — Zero to Production
+
+---
+
+## 🗂️ PHASE GROUP 1 — Foundation (Phases 1–10)
+
+- Phase 1 — Project Planning & Architecture Design
+
+    **What you do:**
+
+    - [x]  Write one paragraph: exactly what problem this engine solves
+    - [x]  List real-world use cases: email sending, image resizing, report generation, notifications
+    - [x]  Draw the four Redis data structures on paper: waiting (Sorted Set), active (Hash), failed (Sorted Set), jobs (Hash)
+    - [x]  Draw the job lifecycle: created → waiting → active → completed/failed → DLQ
+    - [x]  Write down every component: Queue, Worker, Scheduler, Watchdog, Dashboard
+    - [x]  Define what "done" means for this project (live dashboard + 3 Docker workers)
+
+    **What you learn:**
+
+    - How to scope a systems project before writing code
+    - Why background job queues exist: decoupling producers from consumers
+    - The four states of every job and why each Redis structure was chosen
+    - Difference between a job queue and a message broker (Kafka, RabbitMQ)
+- Phase 2 — Repository & TypeScript Setup
+
+    **What you do:**
+
+    - [x]  Create GitHub repo `AtomicQ` — public
+    - [x]  Clone to machine, create folder structure: src/, tests/, scripts/, dashboard/
+    - [x]  npm init -y → install: typescript, ts-node, nodemon, @types/node
+    - [x]  Create tsconfig.json: target ES2020, strict true, outDir dist
+    - [x]  Add npm scripts: dev (nodemon src/index.ts), build (tsc), test (jest)
+    - [x]  Create src/index.ts printing "Queue Engine starting..."
+    - [x]  Verify: npm run dev → see message
+    - [x]  First commit: "Initial TypeScript project setup"
+
+    **What you learn:**
+
+    - How to initialize a TypeScript Node.js project from scratch
+    - What tsconfig strict mode enforces
+    - Why nodemon hot-reloads on file save
+    - Git workflow: feature branches, atomic commits
+- Phase 3 — ioredis Setup & Connection
+
+    **What you do:**
+
+    - [x]  Install ioredis and @types/ioredis (or built-in types)
+    - [x]  Install Docker Desktop if not installed
+    - [x]  Run Redis via Docker: `docker run -d -p 6379:6379 redis:7-alpine`
+    - [x]  Create src/redis.ts: create and export ioredis client with connection config
+    - [x]  Add retry strategy: reconnect every 500ms, max 10 retries
+    - [x]  Add event listeners: connect, error, reconnecting — log each
+    - [x]  Create test script: set key, get key, delete key — confirm round trip
+    - [x]  Test: stop Docker Redis → watch reconnect logs → restart → watch reconnect succeed
+
+    **What you learn:**
+
+    - What ioredis is and why it's preferred over the `redis` npm package
+    - What a Redis connection pool is
+    - What retry strategy means: how clients handle Redis downtime
+    - Why you need a dedicated Redis connection per role (reading vs pub/sub)
+- Phase 4 — Redis Data Structure Deep Dive
+
+    **What you do:**
+
+    - [x]  Open Redis CLI: `docker exec -it <container> redis-cli`
+    - [x]  Practice Sorted Sets: ZADD, ZRANGEBYSCORE, ZREM, ZSCORE, ZCARD
+    - [x]  Practice Hashes: HSET, HGET, HGETALL, HDEL, HKEYS
+    - [x]  Practice Strings: SET, GET, SETEX, TTL, DEL
+    - [x]  Practice Pub/Sub: SUBSCRIBE channel, PUBLISH channel message (two terminal windows)
+    - [x]  Write src/test/redis-structures.ts exercising all four structures from Node.js
+    - [x]  Understand the score in Sorted Set = runAt timestamp (milliseconds)
+
+    **What you learn:**
+
+    - Sorted Set: ordered by score, O(log N) insert, range queries by score — perfect for scheduled jobs
+    - Hash: field-value map, O(1) per field — perfect for job metadata
+    - Why Sorted Set score = timestamp enables delayed jobs and priority queues natively
+    - What Pub/Sub is: fire-and-forget messaging between Redis clients
+    - Why Pub/Sub suits dashboard events (no durability needed)
+- Phase 5 — Job Schema & Type System
+
+    **What you do:**
+
+    - [x]  Create src/types.ts with all TypeScript interfaces
+    - [x]  Define Job<T> interface: id, name, data (generic T), status, priority, attempts, maxAttempts, runAt, createdAt, startedAt, completedAt, failedAt, error, progress, heartbeatAt
+    - [x]  Define JobOptions: delay, priority, attempts, backoff (type: 'fixed'|'exponential', delay: number)
+    - [x]  Define JobStatus enum: WAITING, ACTIVE, COMPLETED, FAILED, DELAYED
+    - [x]  Define QueueMetrics: waiting, active, completed, failed, delayed
+    - [x]  Write a factory function createJob(name, data, options) returning Job
+
+    **What you learn:**
+
+    - How to model domain objects with TypeScript generics (Job<EmailData>, Job<ResizeData>)
+    - What an enum is and when to use it vs string literals
+    - Why typing job data generically matters: type safety for each queue
+    - The importance of timestamps: every state transition needs a timestamp for debugging
+- Phase 6 — Key Naming Convention & Redis Layout
+
+    **What you do:**
+
+    - [x]  Create src/keys.ts with all Redis key templates as functions
+    - [x]  Define: jobKey(queueName, jobId), waitingKey(queueName), activeKey(queueName), failedKey(queueName), completedKey(queueName), metricsKey(queueName), channelKey(queueName)
+    - [x]  Examples: queue:emails:jobs:{id}, queue:emails:waiting, queue:emails:active
+    - [x]  Write unit test: call each key function, assert exact string output
+    - [x]  Understand why consistent key naming prevents bugs in multi-worker environments
+
+    **What you learn:**
+
+    - Why Redis key naming conventions matter at scale
+    - What key namespacing is: using prefixes to prevent collisions between queues
+    - How to design a key schema before writing any logic
+    - Why functions are better than template strings scattered across files
+- Phase 7 — UUID Generation & Job ID Strategy
+
+    **What you do:**
+
+    - [x]  Install uuid and @types/uuid
+    - [x]  Create src/utils.ts: generateJobId() returning UUID v4
+    - [x]  Understand why sequential IDs are dangerous in distributed systems
+    - [x]  Write a test: generate 10,000 IDs — verify no collisions
+    - [x]  Add timestamp-prefixed ID option: `${Date.now()}-${uuid()}` — sortable + unique
+    - [x]  Decide which format to use and document why in a code comment
+
+    **What you learn:**
+
+    - What UUID v4 is: random 128-bit identifier
+    - Why sequential IDs fail in distributed systems: two workers can generate the same ID
+    - What ULID is: Universally Unique Lexicographically Sortable Identifier — sortable UUIDs
+    - Why job IDs being sortable is useful for debugging
+- Phase 8 — Environment Config & Validation
+
+    **What you do:**
+
+    - [x]  Install dotenv
+    - [x]  Create .env: REDIS_URL, QUEUE_DEFAULT_CONCURRENCY, HEARTBEAT_INTERVAL_MS, STALL_THRESHOLD_MS, SCHEDULER_POLL_MS
+    - [x]  Create .env.example with documented empty values
+    - [x]  Create src/config.ts: load and validate all env vars with defaults
+    - [x]  Add startup validation: if REDIS_URL missing, throw clear error before any Redis connection
+    - [x]  Add .env and .env.example to .gitignore and track .env.example only
+    - [x]  Test: remove REDIS_URL → confirm startup error message
+
+    **What you learn:**
+
+    - 12-factor app config principles
+    - Why validate env vars at startup: fail fast, not at runtime when processing job 1,000
+    - What default values mean in config: sensible behavior without configuration
+    - Why .env.example is the contract between your code and operators
+- Phase 9 — Lua Scripting Fundamentals
+
+    **What you do:**
+
+    - [x]  Read: why Lua scripts in Redis are atomic (single-threaded Redis executes whole script)
+    - [x]  Write first Lua script in Redis CLI: `EVAL "return 'hello from lua'" 0`
+    - [x]  Write Lua script that reads a key and returns double its value
+    - [x]  Understand KEYS and ARGV tables in Lua Redis scripts
+    - [x]  Write Lua script: if key exists and value > 0, decrement and return 1; else return 0 — this is a token bucket
+    - [x]  Load script using ioredis: `redis.eval(script, numkeys, ...keys, ...args)`
+    - [x]  Understand SHA caching: SCRIPT LOAD → EVALSHA for repeated calls
+
+    **What you learn:**
+
+    - Why Lua scripts are the foundation of race-condition-free Redis operations
+    - What atomicity means in Redis: no other command runs between Lua lines
+    - The KEYS vs ARGV distinction: keys for Redis key names, ARGV for values
+    - Why EVALSHA is faster than EVAL: avoids re-sending script source every call
+    - This is the hardest concept in the whole project — master it here
+- Phase 10 — ioredis defineCommand & Script Loading
+
+    **What you do:**
+
+    - [x]  Create scripts/ directory with three empty .lua files: enqueue.lua, moveToActive.lua, moveToFailed.lua
+    - [x]  Create src/scripts.ts: load all .lua files using fs.readFileSync at startup
+    - [x]  Use ioredis defineCommand() to register each script as a custom command
+    - [x]  Write a simple test script: enqueue.lua just sets a test key and returns 'ok'
+    - [x]  Call the custom command from Node.js and verify it executes
+    - [x]  Add error handling: if script compilation fails, throw error with script name
+
+    **What you learn:**
+
+    - How ioredis.defineCommand() works: adds typed method to redis client
+    - Why loading scripts at startup is better than inline EVAL strings
+    - How to read files with fs.readFileSync in TypeScript
+    - The pattern: define once, call many times using EVALSHA
+
+---
+
+## 🗂️ PHASE GROUP 2 — Core Queue (Phases 11–20)
+
+- Phase 11 — enqueue.lua — Atomic Job Enqueue
+
+    **What you do:**
+
+    - [x]  Write enqueue.lua: accepts jobId, serializedJob, score (runAt timestamp)
+    - [x]  Script steps: HSET jobs-hash jobId serializedJob → ZADD waiting-sorted-set score jobId
+    - [x]  Both operations in one script = atomic: either both succeed or neither does
+    - [x]  Test: enqueue 5 jobs, inspect Redis with CLI — verify both HSET and ZADD happened
+    - [x]  Test crash simulation: use DEBUG SLEEP in Lua (if available) to understand atomicity
+    - [x]  Verify: ZRANGEBYSCORE waiting 0 +inf returns all 5 job IDs in order
+
+    **What you learn:**
+
+    - Why enqueue needs two Redis operations: job data in Hash + job ID in Sorted Set
+    - What happens without Lua: if HSET succeeds but ZADD fails, job data exists but is never scheduled — orphaned data
+    - Atomicity in practice: not theoretical, solves a real bug
+    - How ZADD scores work: lower score = earlier in queue
+- Phase 12 — Queue Class Foundation
+
+    **What you do:**
+
+    - [x]  Create src/Queue.ts with class Queue
+    - [x]  Constructor: accepts queueName and redis client
+    - [x]  Implement add(name: string, data: T, options?: JobOptions): Promise<Job<T>>
+    - [x]  add() should: generate job ID → create Job object → serialize to JSON → call enqueue Lua script
+    - [x]  Implement getJob(jobId: string): Promise<Job | null> — read from Redis Hash
+    - [x]  Implement getJobCount(status: JobStatus): Promise<number> — ZCARD or HLEN
+    - [x]  Write test: add 10 jobs → getJob for each → verify data matches
+
+    **What you learn:**
+
+    - How to wrap low-level Redis commands in a clean class API
+    - What JSON serialization means for job data: everything must be JSON-serializable
+    - How generics work in class methods: Queue.add<EmailData>(...)
+    - Why getJob reads from the Hash (not the Sorted Set): Sorted Set only stores IDs
+- Phase 13 — Priority Queue with Multiple Sorted Sets
+
+    **What you do:**
+
+    - [x]  Create three Sorted Sets per queue: waiting:high, waiting:normal, waiting:low
+    - [x]  Update enqueue.lua: route to correct Sorted Set based on priority option
+    - [x]  Update Queue.add() to pass priority to script
+    - [x]  Update key functions in keys.ts for priority variants
+    - [x]  Test: add 5 low, 5 normal, 5 high priority jobs — verify counts in each set
+
+    **What you learn:**
+
+    - How priority queues work: workers check high first, then normal, then low
+    - Why separate Sorted Sets beat a single set with priority encoding in score: cleaner fan-out logic
+    - What O(log N) insert complexity means for sorted sets at scale
+- Phase 14 — Delayed Jobs (runAt Score)
+
+    **What you do:**
+
+    - [x]  Update Queue.add(): if options.delay provided, set runAt = [Date.now](http://Date.now)() + delay
+    - [x]  Delayed jobs land in waiting Sorted Set with future timestamp as score
+    - [x]  Write test: add job with 5s delay → ZRANGEBYSCORE waiting 0 [Date.now](http://Date.now)() → job NOT in results → wait 5s → same query → job NOW in results
+    - [x]  Understand: Sorted Set score is the exact mechanism enabling delayed jobs — no extra structure needed
+    - [x]  Add Queue.getDelayedJobs(): returns jobs where score > [Date.now](http://Date.now)()
+
+    **What you learn:**
+
+    - How delayed jobs emerge naturally from the Sorted Set score = timestamp design
+    - What ZRANGEBYSCORE waiting 0 [Date.now](http://Date.now)() means: all jobs ready to run right now
+    - Why this is elegant: delayed and immediate jobs live in same structure, zero extra code
+    - How cron jobs will use this same mechanism (Phase 29)
+- Phase 15 — moveToActive.lua — Atomic Job Pickup
+
+    **What you do:**
+
+    - [x]  Write moveToActive.lua: ZRANGEBYSCORE to find one ready job → ZREM from waiting → HSET into active hash with startedAt + heartbeatAt timestamps
+    - [x]  If no ready job: return nil (worker knows queue is empty)
+    - [x]  The entire script is atomic: no two workers can pick up the same job
+    - [x]  Test with single worker: call script 5 times for 5 jobs — each returns different job
+    - [x]  Test concurrent safety manually: simulate two workers calling simultaneously (will test properly in Phase 22)
+
+    **What you learn:**
+
+    - Why moving a job from waiting → active must be atomic: without Lua, two workers both see the same job and process it twice
+    - What "at-least-once delivery" means vs "exactly-once": Lua gives at-least-once (worker can crash after pickup before completing)
+    - The ZRANGEBYSCORE + ZREM pattern: check-then-act atomically
+    - This script is the single most important piece of the entire engine
+- Phase 16 — Worker Class Foundation
+
+    **What you do:**
+
+    - [x]  Create src/Worker.ts with class Worker
+    - [x]  Constructor: queueName, processor function, options (concurrency: number)
+    - [x]  Implement start(): begins poll loop
+    - [x]  Implement stop(): graceful shutdown — finish active jobs, stop polling
+    - [x]  Poll loop: call moveToActive Lua script → if job returned, process it → if null, wait pollInterval ms
+    - [x]  Implement processJob(job): call user's processor function → handle success/failure
+    - [x]  Test: add 3 jobs → start worker → verify all 3 processed
+
+    **What you learn:**
+
+    - How a worker poll loop works: busy-wait with backoff when queue empty
+    - What graceful shutdown means: don't kill mid-job, finish current work then exit
+    - How processor functions work: worker provides the job, user provides the logic
+    - Why workers are separate processes: can scale horizontally
+- Phase 17 — Job Completion & moveToCompleted
+
+    **What you do:**
+
+    - [x]  Write moveToCompleted.lua: HDEL from active hash → HSET into completed hash with completedAt
+    - [x]  Update Worker: after successful processor call → run moveToCompleted script
+    - [x]  Add completed Sorted Set with completedAt as score (for time-based queries)
+    - [x]  Implement Queue.getCompletedJobs(limit): returns N most recent completed jobs
+    - [x]  Test: process 5 jobs → check completed count → verify job data in completed hash
+    - [x]  Add job retention: completed jobs older than 24h auto-delete (set TTL on completed hash)
+
+    **What you learn:**
+
+    - Why completed jobs need to be stored (temporarily): debugging, reporting, idempotency checks
+    - What TTL-based cleanup means: Redis auto-deletes stale data — no manual cron needed
+    - How to query completed jobs by time range using Sorted Set score
+- Phase 18 — Job Failure & Retry Logic
+
+    **What you do:**
+
+    - [x]  Write moveToFailed.lua: HDEL from active → if attempts < maxAttempts: ZADD back to waiting with backoff delay as score → else: ZADD to failed Sorted Set with failedAt
+    - [x]  Implement backoff calculation in TypeScript: fixed delay vs exponential (delay * 2^attempt)
+    - [x]  Update Worker: on processor throw → increment attempts → run moveToFailed script
+    - [x]  Test fixed backoff: job fails → appears in waiting with future score → worker picks up after delay
+    - [x]  Test exponential: attempt 1 = 1s, attempt 2 = 2s, attempt 3 = 4s
+    - [x]  Test maxAttempts: after N failures → job lands in failed Sorted Set (DLQ)
+
+    **What you learn:**
+
+    - What retry backoff is: waiting longer between retries to avoid hammering failing services
+    - What exponential backoff is: doubling wait time — industry standard for resilient systems
+    - What a Dead Letter Queue (DLQ) is: permanent home for jobs that exceeded retries
+    - Why maxAttempts prevents infinite retry loops
+- Phase 19 — Error Capture & Job Error Payload
+
+    **What you do:**
+
+    - [x]  Update Worker: when processor throws, capture error.message and error.stack
+    - [x]  Store error payload in job data: { message, stack, failedAt, attemptNumber }
+    - [x]  Update moveToFailed.lua to include serialized error in job Hash
+    - [x]  Add Queue.getFailedJobs(limit): returns jobs from failed Sorted Set with error details
+    - [x]  Test: write a processor that always throws with specific message → verify error captured in Redis
+    - [x]  Test: write a processor that throws on attempt 1-2 but succeeds on attempt 3 → verify eventual success
+
+    **What you learn:**
+
+    - Why capturing stack traces in job storage enables async debugging
+    - The difference between transient failures (network timeout) and permanent failures (invalid data)
+    - How to distinguish which attempt number caused which error
+    - Why error details in the DLQ are essential for on-call engineers
+- Phase 20 — Queue.getMetrics() & Job Counts
+
+    **What you do:**
+
+    - [x]  Implement Queue.getMetrics(): returns QueueMetrics object
+    - [x]  Use Redis pipeline (MULTI/EXEC) to fetch all counts in one round trip
+    - [x]  Counts: ZCARD waiting:high, ZCARD waiting:normal, ZCARD waiting:low, HLEN active, ZCARD completed, ZCARD failed
+    - [x]  Add throughput tracking: completed/min using a sliding window counter in Redis
+    - [x]  Sliding window: ZADD throughput:completions <timestamp> <jobId> → ZCOUNT with 1-minute range
+    - [x]  Test: add 20 jobs, process 15, fail 5 → verify metrics match
+
+    **What you learn:**
+
+    - What a Redis pipeline is: batching multiple commands in one network round trip
+    - Why pipelines matter: 6 separate commands = 6 round trips vs 1 pipeline = 1 round trip
+    - What a sliding window counter is: tracks events in a rolling time window
+    - How throughput is calculated: events per time unit using sorted set timestamps
+
+---
+
+## 🗂️ PHASE GROUP 3 — Concurrency & Reliability (Phases 21–30)
+
+- Phase 21 — Concurrency Control with Semaphore
+
+    **What you do:**
+
+    - [x]  Add concurrency limit to Worker class (default: 1)
+    - [x]  Implement semaphore: a counter `activeCount` gating how many jobs run simultaneously
+    - [x]  Poll loop logic: if activeCount >= concurrency → don't fetch new job → wait pollInterval
+    - [x]  On job start: activeCount++ | On job finish (success or fail): activeCount--
+    - [x]  Test concurrency: 3 — add 20 jobs with 200ms delay each → verify max 3 run at same time
+    - [x]  Log activeCount in each iteration to confirm it never exceeds limit
+
+    **What you learn:**
+
+    - What a semaphore is: a counter used to control access to a shared resource
+    - Why concurrency matters: 1 worker processing 1 job = wasted I/O wait time; concurrency 5 = 5x throughput for I/O-bound jobs
+    - The difference between CPU-bound and I/O-bound work
+    - How Node.js handles concurrency: event loop + async/await = concurrent without threads
+- Phase 22 — Heartbeat System
+
+    **What you do:**
+
+    - [x]  When worker picks up a job: set heartbeatAt = [Date.now](http://Date.now)() in active Hash
+    - [x]  Create heartbeat loop: every HEARTBEAT_INTERVAL_MS (default 5s), update heartbeatAt for all active jobs
+    - [x]  Use ioredis pipeline to update all active job heartbeats in one round trip
+    - [x]  Add heartbeat loop to Worker.start() and stop to Worker.stop()
+    - [x]  Test: start worker, process a slow job (artificial setTimeout) → watch heartbeatAt update in Redis CLI every 5s
+
+    **What you learn:**
+
+    - What a heartbeat is: periodic signal proving a worker is still alive
+    - Why heartbeats are the foundation of crash detection: if heartbeat stops, worker is dead
+    - What liveness probes are in distributed systems (same concept used in Kubernetes)
+    - Why updating heartbeat via pipeline is important: don't fire N individual commands for N active jobs
+- Phase 23 — Watchdog: Stall Detection
+
+    **What you do:**
+
+    - [x]  Create src/Watchdog.ts with class Watchdog
+    - [x]  Watchdog runs independently: every WATCHDOG_INTERVAL_MS (default 10s)
+    - [x]  Scan all jobs in active Hash: HGETALL active
+    - [x]  For each job: check heartbeatAt — if now - heartbeatAt > STALL_THRESHOLD_MS (default 30s) → job is stalled
+    - [x]  Stalled job: increment attempts → run moveToFailed Lua script with error: "Job stalled — worker likely crashed"
+    - [x]  Test: start job → kill worker process mid-execution → wait 30s → verify job moves back to waiting
+
+    **What you learn:**
+
+    - What stall detection is: the mechanism that makes job queues self-healing after worker crashes
+    - Why Kubernetes pod restarts aren't enough: the job is still locked in active Hash
+    - What HGETALL does and when to be careful (large active sets)
+    - This is what makes the system "reliable" — without this, crashed jobs are lost forever
+- Phase 24 — Watchdog Atomicity with Lua
+
+    **What you do:**
+
+    - [x]  Write recoverStalledJob.lua: check heartbeatAt in active Hash → if stale: HDEL from active → ZADD back to waiting with incremented attempt count
+    - [x]  Replace Node.js-level stall recovery with this Lua script
+    - [x]  Understand why this matters: without Lua, Watchdog reads then deletes — race condition between read and delete
+    - [x]  Test with two Watchdog instances running simultaneously: verify job recovered exactly once
+
+    **What you learn:**
+
+    - Why even Watchdog needs atomic operations: two Watchdogs can both detect the same stall
+    - Check-then-act is always a race condition without atomicity
+    - Real-world systems run multiple Watchdog instances for HA (high availability)
+    - This is the same pattern Redis uses for distributed locks (Redlock)
+- Phase 25 — Adaptive Poll Backoff
+
+    **What you do:**
+
+    - [x]  Implement adaptive backoff in Worker poll loop
+    - [x]  If last poll returned a job: poll again immediately (queue might have more)
+    - [x]  If last poll returned null: double the wait time (up to MAX_POLL_INTERVAL, default 5s)
+    - [x]  If worker just processed a job: reset backoff to minimum
+    - [x]  Test: add 20 jobs rapidly → worker processes fast with no backoff → queue empties → backoff kicks in → add more jobs → backoff resets
+    - [x]  Measure: compare CPU usage with fixed 500ms poll vs adaptive — adaptive uses far less CPU on idle queues
+
+    **What you learn:**
+
+    - What backpressure is: self-throttling when there's no work to do
+    - Why polling at fixed 500ms on empty queues wastes CPU and Redis connections
+    - What exponential backoff means for polling (same principle as retry backoff)
+    - How adaptive polling is implemented in BullMQ
+- Phase 26 — Progress Tracking
+
+    **What you do:**
+
+    - [x]  Add job.updateProgress(percent: number) method
+    - [x]  updateProgress: HSET jobs:{jobId} progress percent
+    - [x]  Worker passes job object to processor function so processor can call job.updateProgress()
+    - [x]  Publish progress event to Redis Pub/Sub channel: queue:{name}:events
+    - [x]  Event payload: { event: 'progress', jobId, progress, queueName }
+    - [x]  Test: write processor that calls updateProgress(25), (50), (75), (100) — verify Redis values update
+
+    **What you learn:**
+
+    - How job progress works in BullMQ
+    - What Redis Pub/Sub is: fire-and-forget event broadcasting
+    - Why progress events go through Pub/Sub: dashboard subscribes from anywhere
+    - How the processor function receives the job object (closure pattern)
+- Phase 27 — Event System with Redis Pub/Sub
+
+    **What you do:**
+
+    - [x]  Create src/EventEmitter.ts wrapping Redis Pub/Sub
+    - [x]  Define all event types: job:completed, job:failed, job:progress, job:active, job:stalled
+    - [x]  Every state transition in Worker + Watchdog publishes to queue:{name}:events channel
+    - [x]  Event payload: { event, jobId, data, timestamp, queueName, workerPid }
+    - [x]  Create subscriber connection (separate ioredis instance — Pub/Sub blocks the connection)
+    - [x]  Test: run subscriber, process jobs, verify events arrive with correct payloads
+
+    **What you learn:**
+
+    - Why Pub/Sub requires a separate Redis connection: a subscribed connection can only receive, not send
+    - What workerPid tells you: which of your N workers processed this job
+    - Why events are fire-and-forget: if dashboard is offline, events are missed (acceptable tradeoff)
+    - The observer pattern in distributed systems
+- Phase 28 — Rate Limiting with Token Bucket
+
+    **What you do:**
+
+    - [x]  Write tokenBucket.lua: check current tokens and lastRefill → refill tokens based on time elapsed → if tokens > 0: decrement and return 1 → else: return 0 (rate limited)
+    - [x]  Create src/RateLimiter.ts: wraps tokenBucket.lua with queue-level rate limiting
+    - [x]  Integrate into Worker: before picking up job → check rate limit → if limited, wait
+    - [x]  Configure per queue: maxJobsPerInterval, interval (e.g., 100 jobs per minute)
+    - [x]  Test: set limit to 5/second → add 20 jobs → verify processed at ~5/second rate
+
+    **What you learn:**
+
+    - What a token bucket algorithm is: tokens refill at constant rate, each job consumes a token
+    - Why rate limiting prevents external API abuse (e.g., email provider limits)
+    - What the token bucket guarantees: bursts are allowed up to bucket size, long-term rate is capped
+    - Alternative: leaky bucket (constant rate, no bursts) — understand the difference
+- Phase 29 — Scheduler: Delayed Job Promotion
+
+    **What you do:**
+
+    - [x]  Create src/Scheduler.ts — runs a poll loop every SCHEDULER_POLL_MS (default 500ms)
+    - [x]  Write promoteDelayedJobs.lua: ZRANGEBYSCORE waiting -inf <now> LIMIT 0 100 → for each job: change score to 0 (promote to immediate)
+    - [x]  Actually: delayed and immediate jobs are already in same Sorted Set — scheduler just wakes up workers
+    - [x]  Simpler: Scheduler publishes 'jobs:ready' event → workers check queue
+    - [x]  Test: add 5 jobs with 3s delay → Scheduler promotes them after 3s → worker processes
+    - [x]  Measure: job runs within SCHEDULER_POLL_MS of its scheduled time
+
+    **What you learn:**
+
+    - Why a dedicated Scheduler process exists: workers block on I/O; scheduler is a lightweight timer
+    - What polling interval precision means: 500ms scheduler → jobs run within 500ms of scheduled time
+    - How cron jobs use this: cron expression → next run time → Scheduler adds job to waiting with that score
+    - The tradeoff: lower poll interval = more Redis calls but better precision
+- Phase 30 — Cron Job Support
+
+    **What you do:**
+
+    - [x]  Install cron-parser (parses cron expressions like '*/5*   ** *')
+    - [x]  Add Queue.addRepeatable(name, data, cronExpression) method
+    - [x]  Store cron job definition in Redis Hash: queue:{name}:cron:{jobName}
+    - [x]  Scheduler checks cron definitions every poll: if nextRun <= now → add job to waiting → compute next run → update cron definition
+    - [x]  Prevent duplicate cron jobs: use job name as unique key — if already in waiting, skip
+    - [x]  Test: add cron job running every 10s → verify it runs ~6 times per minute
+
+    **What you learn:**
+
+    - What a cron expression is: '*/5*   ** *' = every 5 minutes
+    - How cron-parser calculates the next run time from an expression
+    - Why idempotent job addition matters for cron: Scheduler might run on multiple nodes
+    - How BullMQ implements repeatable jobs under the hood
+
+---
+
+## 🗂️ PHASE GROUP 4 — Dashboard (Phases 31–38)
+
+- Phase 31 — Dashboard Server Foundation
+
+    **What you do:**
+
+    - [x]  Install express, [socket.io](http://socket.io), @types/express
+    - [x]  Create dashboard/server.ts: Express server on port 3002
+    - [x]  Serve dashboard/index.html as static file
+    - [x]  Initialize [Socket.IO](http://Socket.IO) server on same Express app
+    - [x]  Subscribe to Redis Pub/Sub channel: queue:*:events (all queues)
+    - [x]  On each Redis event: emit to all [Socket.IO](http://Socket.IO) clients with [socket.io](http://socket.io).emit('job-event', data)
+    - [x]  Test: start dashboard server → open http://localhost:3002 → run jobs → open browser console → confirm events arriving
+
+    **What you learn:**
+
+    - How [Socket.IO](http://Socket.IO) differs from plain WebSockets: auto-reconnect, rooms, namespaces
+    - Why dashboard subscribes to Redis Pub/Sub: works across multiple worker processes on multiple machines
+    - What [socket.io](http://socket.io).emit() does: broadcasts to all connected clients
+    - How one Pub/Sub subscriber can fan out to N [Socket.IO](http://Socket.IO) clients
+- Phase 32 — Dashboard REST API
+
+    **What you do:**
+
+    - [x]  Create dashboard/routes.ts
+    - [x]  GET /api/queues — list all queue names (from Redis key scan with pattern queue:*:waiting)
+    - [x]  GET /api/queues/:name/metrics — call Queue.getMetrics()
+    - [x]  GET /api/queues/:name/jobs/:status — paginated job list (limit + offset)
+    - [x]  GET /api/queues/:name/jobs/:jobId — single job detail
+    - [x]  POST /api/queues/:name/jobs/:jobId/retry — move failed job back to waiting
+    - [x]  DELETE /api/queues/:name/jobs/failed — clear all failed jobs
+    - [x]  Test all endpoints with Thunder Client or curl
+
+    **What you learn:**
+
+    - How to design REST APIs for operational tooling
+    - What pagination means in API design: never return unbounded lists
+    - What Redis SCAN is: iterates keys without blocking (unlike KEYS which blocks)
+    - Why manual retry from dashboard is essential for operations teams
+- [x] Phase 33 — Dashboard HTML + [Socket.IO](http://Socket.IO) Client
+
+    **What you do:**
+
+    - [x] Create dashboard/index.html — (Implemented as React App for better scalability)
+    - [x] Add [Socket.IO](http://Socket.IO) client via CDN: <script src="/[socket.io/socket.io.js](http://socket.io/socket.io.js)"> (Implemented via npm package)
+    - [x] Show queue selector dropdown (populated from GET /api/queues)
+    - [x] Show metrics cards: Waiting, Active, Completed, Failed, Throughput/min
+    - [x] Update metric numbers in real-time as [Socket.IO](http://Socket.IO) events arrive
+    - [x] Add live job feed: last 20 events as list with job name, status, duration
+    - [x] Test: run 50 jobs → watch dashboard update without page refresh
+
+    **What you learn:**
+
+    - How [Socket.IO](http://Socket.IO) client connects and receives events in browser JavaScript
+    - How to update DOM in real-time without frameworks
+    - What long-polling fallback means: [Socket.IO](http://Socket.IO) falls back to HTTP polling if WebSockets blocked
+    - Why a single HTML file dashboard is simpler to deploy than a React app
+- [x] Phase 34 — Job List with Filtering & Pagination
+
+    **What you do:**
+
+    - [x] Add tabbed UI: Waiting / Active / Completed / Failed
+    - [x] Each tab calls GET /api/queues/:name/jobs/:status with page param
+    - [x] Waiting jobs table: columns — Job Name, Priority, Scheduled At, Attempts
+    - [x] Active jobs table: Job Name, Started At, Heartbeat (color red if stale), Worker PID
+    - [x] Completed jobs table: Job Name, Duration, Completed At, Quality Score
+    - [x] Failed jobs table: Job Name, Error Message, Failed At, Retry button
+    - [x] Add pagination controls: Previous / Next (Impl. as "Load More" for better infinite scroll feel)
+
+    **What you learn:**
+
+    - How to build tabbed UI with vanilla JavaScript
+    - What stale heartbeat visualization communicates: operators see crashed workers instantly
+    - How to implement client-side pagination from API offset/limit parameters
+    - UX principle: failed jobs need actionable buttons, not just data
+- Phase 35 — Throughput Chart
+
+    **What you do:**
+
+    - [x]  Add Chart.js via CDN (Implemented as a hand-written SVG chart — no chart library)
+    - [x]  Create GET /api/queues/:name/throughput — returns completed/failed counts per minute for last 10 minutes
+    - [x]  Dashboard fetches throughput data every 30s
+    - [x]  Render line chart: x-axis = time, y-axis = jobs/minute, two lines: completed (green) + failed (red)
+    - [x]  On [Socket.IO](http://Socket.IO) job:completed event: increment current-minute counter locally in browser
+    - [x]  Test: run 100 jobs over 3 minutes → watch chart build in real-time
+
+    **What you learn:**
+
+    - How Chart.js renders line charts with dynamic data
+    - What throughput means: jobs processed per unit of time
+    - How to combine REST (historical data) with WebSocket (live updates) in one chart
+    - The difference between p50 latency and throughput — understand both metrics
+- Phase 36 — Latency Tracking & p95
+
+    **What you do:**
+
+    - [x]  Record job processing duration: completedAt - startedAt in milliseconds
+    - [x]  Store last 1000 durations in Redis sorted set: ZADD latency:{queueName} duration jobId
+    - [x]  Implement p95 calculation: ZRANGE latency sorted set, take 95th percentile
+    - [x]  Add latency metrics to GET /api/queues/:name/metrics response
+    - [x]  Display p50, p95, p99 on dashboard
+    - [x]  Test: run jobs with variable duration (random sleep) → verify p95 is approximately correct
+
+    **What you learn:**
+
+    - What percentile latency means: p95 = 95% of jobs complete within this time
+    - Why p95 is more useful than average: average hides tail latency outliers
+    - What tail latency is: the slow outliers that users actually experience
+    - How BullMQ metrics dashboard calculates these numbers
+- Phase 37 — Manual Retry & Bulk Operations
+
+    **What you do:**
+
+    - [x]  Implement retry button on failed jobs: calls POST /api/.../retry
+    - [x]  Retry logic: ZREM from failed → reset attempts to 0 → ZADD to waiting with score = [Date.now](http://Date.now)()
+    - [x]  Add "Retry All Failed" button: iterates all failed jobs and retries each
+    - [x]  Add "Clear Completed" button: removes all completed jobs older than 1 hour
+    - [x]  Add "Pause Queue" toggle: workers check pause flag in Redis before picking jobs
+    - [x]  Test: fail 10 jobs → click Retry All → verify all 10 process successfully
+
+    **What you learn:**
+
+    - What operational controls mean in job queues: ability to intervene without code deploys
+    - How queue pause/resume works: a Redis flag workers poll
+    - Why bulk retry is essential: production incidents can fail hundreds of jobs
+    - How to implement optimistic UI updates (button shows immediate feedback)
+- Phase 38 — Worker Status Panel
+
+    **What you do:**
+
+    - [x]  Workers publish heartbeat to Redis Hash: workers:{queueName}:{pid} = { pid, host, startedAt, jobsProcessed, currentJob }
+    - [x]  GET /api/workers — dashboard reads this Hash to list all active workers
+    - [x]  Dashboard shows worker panel: PID, host, jobs processed, current job, last heartbeat
+    - [x]  Color-code: green if heartbeat < 15s, yellow 15-30s, red > 30s
+    - [x]  Test: start 3 workers → see all 3 in panel → kill one → watch it go red after 30s (A killed worker's status key expires after 3 missed heartbeats, so it drops off the panel)
+
+    **What you learn:**
+
+    - How distributed systems track worker health
+    - What worker discovery means: how the dashboard knows how many workers exist
+    - The relationship between worker heartbeat and job heartbeat (two separate mechanisms)
+    - Why displaying worker host is important in Docker/Kubernetes environments
+
+---
+
+## 🗂️ PHASE GROUP 5 — Testing & Hardening (Phases 39–44)
+
+- Phase 39 — Unit Tests: Queue & Worker
+
+    **What you do:**
+
+    - [x]  Install jest, ts-jest, @types/jest
+    - [x]  Create jest.config.ts: ts-jest transform, testEnvironment node (jest.config.js)
+    - [x]  Write tests/queue.test.ts: test add(), getJob(), getMetrics() with real Redis
+    - [x]  Write tests/worker.test.ts: test successful processing, failure handling, retry logic
+    - [x]  Use beforeEach to FLUSHDB (clear all Redis keys) for test isolation
+    - [x]  Test: add 10 jobs, process all → assert metrics show 10 completed
+    - [x]  Test: processor throws → assert job in failed after maxAttempts
+
+    **What you learn:**
+
+    - Why unit tests need real Redis (not mocks): Lua scripts can't be mocked
+    - What FLUSHDB does and why it must only run in test environments
+    - How to use Jest's beforeEach/afterEach for test lifecycle
+    - The difference between unit tests (one function) and integration tests (multiple components)
+- Phase 40 — Integration Tests: Concurrency Safety
+
+    **What you do:**
+
+    - [x]  Write tests/concurrency.test.ts
+    - [x]  Test: start 3 workers with concurrency 2 → add 100 jobs → each job increments a counter in Redis → after all complete, counter must equal exactly 100
+    - [x]  Any value other than 100 = race condition bug
+    - [x]  Test: simulate worker crash during job (process.exit()) → Watchdog recovers → job eventually completes
+    - [x]  Test: add 50 delayed jobs → Scheduler promotes all at once → no duplicates processed
+
+    **What you learn:**
+
+    - How to test for race conditions: run concurrent workers and check for duplicate processing
+    - What test isolation means at the integration level
+    - How to simulate process crashes in tests
+    - Why this test is the most important: it catches the bugs that only appear in production
+- Phase 41 — Load Testing
+
+    **What you do:**
+
+    - [x]  Write scripts/loadTest.ts: adds 10,000 jobs as fast as possible
+    - [x]  Measure: time to enqueue all 10,000 jobs (should be under 5 seconds)
+    - [x]  Start 3 workers with concurrency 5 each = 15 concurrent jobs
+    - [x]  Measure: total time to process all 10,000 jobs
+    - [x]  Monitor: Redis memory usage during load test
+    - [x]  Measure: p50, p95, p99 latency under load
+    - [x]  Identify bottleneck: is it Redis, Lua script overhead, or Node.js?
+
+    **What you learn:**
+
+    - How to write a load testing script
+    - What throughput means under load vs idle
+    - How to interpret Redis INFO STATS during load
+    - What the bottleneck analysis process looks like
+    - Why Redis single-threaded model is both its strength and limitation
+- Phase 42 — Idempotency Keys
+
+    **What you do:**
+
+    - [x]  Add optional idempotencyKey to JobOptions
+    - [x]  Update enqueue.lua: if idempotencyKey provided → SET queue:{name}:idem:{key} jobId NX EX 86400 → if SET returned 0 (key exists), skip enqueue and return existing jobId
+    - [x]  NX = only set if not exists; EX 86400 = expire after 24h
+    - [x]  Test: call queue.add() with same idempotencyKey 10 times → verify only 1 job created
+    - [x]  Test: same key after 24h expiry → new job created successfully
+
+    **What you learn:**
+
+    - What idempotency means: calling an operation N times has same effect as calling once
+    - Why idempotency keys prevent duplicate jobs on client retry
+    - What Redis SET NX EX does: atomic conditional set with expiry
+    - Real-world use: Stripe uses idempotency keys for payment API
+- Phase 43 — Graceful Shutdown
+
+    **What you do:**
+
+    - [x]  Listen for process signals: SIGTERM, SIGINT in Worker and Watchdog
+    - [x]  On signal: stop accepting new jobs → wait for active jobs to complete → close Redis connections → process.exit(0)
+    - [x]  Add timeout: if active jobs don't complete within 30s, force exit with process.exit(1)
+    - [x]  Test: start worker with slow job (5s delay) → send SIGTERM → verify job completes before exit
+    - [x]  Test: send SIGTERM during 35s job → verify force exit after 30s timeout
+
+    **What you learn:**
+
+    - What SIGTERM is: operating system signal asking process to shut down gracefully
+    - What SIGKILL is: forceful kill — no cleanup possible
+    - Why graceful shutdown matters in Kubernetes: pods get SIGTERM before being replaced
+    - What the 30s default terminationGracePeriodSeconds in Kubernetes corresponds to
+- Phase 44 — Testcontainers Integration
+
+    **What you do:**
+
+    - [x]  Install testcontainers
+    - [x]  Update test setup: spawn real Redis Docker container per test suite
+    - [x]  Container lifecycle: startContainer() in beforeAll → stopContainer() in afterAll
+    - [x]  Get dynamic port from container → pass to ioredis client in tests
+    - [x]  Run all existing tests against testcontainers Redis
+    - [x]  Verify: tests pass without any local Redis running
+
+    **What you learn:**
+
+    - What Testcontainers is: spins up real Docker containers in tests
+    - Why this matters for CI/CD: no external Redis dependency in GitHub Actions
+    - What dynamic port allocation means and why it prevents test port conflicts
+    - How professional projects manage test infrastructure
+
+---
+
+## 🗂️ PHASE GROUP 6 — Docker, Scaling & Portfolio (Phases 45–50)
+
+- Phase 45 — Docker Compose Setup
+
+    **What you do:**
+
+    - [x]  Create docker-compose.yml with services: redis, worker (3 replicas), dashboard
+    - [x]  Redis service: image redis:7-alpine, persist data with volume
+    - [x]  Worker service: build from Dockerfile, env from .env file, depends_on redis
+    - [x]  Deploy: `replicas: 3` under worker service
+    - [x]  Dashboard service: build, expose port 3002, depends_on redis
+    - [x]  Test: docker-compose up → verify 3 worker containers + dashboard all running
+    - [x]  Add job from outside Docker → verify one of 3 workers picks it up
+
+    **What you learn:**
+
+    - What Docker Compose is: multi-container orchestration for development
+    - What `replicas` means: Docker starts N identical containers from same image
+    - What `depends_on` means: startup order control
+    - Why volumes persist Redis data between container restarts
+    - How to prove horizontal scaling: same job queue, 3 workers, each picks up different jobs
+- Phase 46 — Dockerfile & Multi-Stage Build
+
+    **What you do:**
+
+    - [x]  Create Dockerfile with two stages: builder + runner
+    - [x]  Builder stage: FROM node:20-alpine → copy source → npm ci → npm run build (tsc)
+    - [x]  Runner stage: FROM node:20-alpine → copy only dist/ and node_modules → CMD node dist/index.js
+    - [x]  Test: docker build → docker run → verify engine starts
+    - [x]  Check image size: multi-stage should be ~150MB vs ~600MB with dev dependencies (Measured: 226MB)
+    - [x]  Add .dockerignore: node_modules, src, *.ts (don't send to Docker build context)
+
+    **What you learn:**
+
+    - What a multi-stage Docker build is: first stage compiles, second stage runs
+    - Why multi-stage matters: production image contains only compiled JS, not TypeScript compiler
+    - What .dockerignore does: prevents sending gigabytes of node_modules to Docker daemon
+    - Why alpine base image is preferred: minimal attack surface + small size
+- Phase 47 — Horizontal Scaling Demonstration
+
+    **What you do:**
+
+    - [x]  Scale workers from 3 to 6: `docker-compose up --scale worker=6`
+    - [x]  Add 1000 jobs → watch dashboard: all 6 workers appear in worker panel
+    - [x]  Verify: jobs are distributed across all 6 workers (no single worker takes all)
+    - [x]  Scale down to 2: `docker-compose up --scale worker=2` → Watchdog recovers any jobs from killed workers
+    - [x]  Measure throughput: 2 workers vs 6 workers — document the scaling factor (1,000 jobs: 184s on 2 workers vs 62.5s on 6 — 2.95x)
+
+    **What you learn:**
+
+    - How horizontal scaling works: more workers = higher throughput linearly (up to Redis limit)
+    - What happens to in-flight jobs when workers are scaled down: Watchdog is the answer
+    - Why this is a portfolio demonstration: run docker-compose up in an interview
+    - What linear scalability means and what breaks it (shared resources like Redis)
+- Phase 48 — Health Checks & Observability
+
+    **What you do:**
+
+    - [x]  Add GET /health to dashboard server: returns { status, redisConnected, activeWorkers, queueDepth }
+    - [x]  Worker exposes HTTP health endpoint on random port: /health returns { pid, activeJobs, uptime }
+    - [x]  Add Docker HEALTHCHECK directive to Dockerfile
+    - [x]  Add structured logging to all components using console.log with JSON format
+    - [x]  Test: docker ps → verify HEALTHY status appears after health check passes
+    - [x]  Test: break Redis → health endpoint returns { status: 'unhealthy' } with 503 status
+
+    **What you learn:**
+
+    - What a health check endpoint is: used by Docker, Kubernetes, and load balancers
+    - What structured logs are: JSON logs searchable in systems like Datadog
+    - Why 503 status code is correct for unhealthy services
+    - How Docker HEALTHCHECK works: Docker polls /health and marks container healthy/unhealthy
+- Phase 49 — README, Architecture Diagram & Demo
+
+    **What you do:**
+
+    - [x]  Write comprehensive [README.md](http://README.md)
+    - [x]  Architecture diagram: draw in Excalidraw → export PNG → embed in README (Mermaid diagram in the README)
+    - [x]  Tech stack table: every tool + why it was chosen
+    - [x]  Features list: atomic operations, concurrency, stall detection, rate limiting, cron, dashboard
+    - [x]  Setup instructions: prerequisites, docker-compose up, verify dashboard
+    - [x]  API reference: Queue class methods with TypeScript signatures
+    - [ ]  Record 3-minute demo video: show dashboard → add jobs → watch workers process → kill a worker → watch Watchdog recover
+    - [ ]  Upload to YouTube (unlisted) → add link to README
+
+    **What you learn:**
+
+    - How to write technical documentation that engineers trust
+    - What an architecture diagram communicates vs what code communicates
+    - How to present a systems project to a technical interviewer
+    - Why a live demo video matters: interviewers don't run your code during screening
+- Phase 50 — Portfolio Polish & Interview Prep
+
+    **What you do:**
+
+    - [ ]  Update resume bullet: "Built a production-grade job queue engine from scratch (Node.js + TypeScript + Redis): atomic Lua scripts for race-condition-free job transitions, semaphore-based concurrency control, stall detection + crash recovery, token bucket rate limiting, [Socket.IO](http://Socket.IO) real-time dashboard — horizontally scalable with Docker Compose."
+    - [ ]  Pin repository to GitHub profile
+    - [ ]  Write LinkedIn post explaining one interesting technical decision (e.g., why Lua scripts)
+    - [ ]  Prepare 5 interview answers: what is a job queue, why Lua, how stall detection works, what exactly-once means, how you'd scale to 1M jobs/day
+    - [ ]  Compare your implementation to BullMQ: what does BullMQ do that you don't? (job groups, flow producers, etc.)
+
+    **What you learn:**
+
+    - How to articulate tradeoffs in system design interviews
+    - Why building something from scratch before using a library makes you a better engineer
+    - What "I built this from first principles" signals to interviewers: you understand the problem, not just the API
+    - The exact questions interviewers ask about job queues at companies like Razorpay, Zepto, PhonePe
+
+---
+
+# ✅ Progress Tracker
+
+| Phase Group | Phases | Status |
+| --- | --- | --- |
+| 🏗️ Foundation | 1–10 | Completed |
+| ⚙️ Core Queue | 11–20 | Completed |
+| 🔄 Concurrency & Reliability | 21–30 | ✅ Completed |
+| 📊 Dashboard | 31–38 | ✅ Completed |
+| 🧪 Testing & Hardening | 39–44 | ✅ Completed |
+| 🐳 Docker & Portfolio | 45–50 | In Progress (45–48 done; 49 needs the demo video; 50 not started) |
+
+---
+
+# ⏱️ Time Estimate
+
+| Phases | Days (4–5 hrs/day) |
+| --- | --- |
+| Phases 1–10 | Days 1–5 |
+| Phases 11–20 | Days 6–12 |
+| Phases 21–30 | Days 13–18 |
+| Phases 31–38 | Days 19–23 |
+| Phases 39–44 | Days 24–27 |
+| Phases 45–50 | Days 28–30 |
+| **Total** | **~30 days to production-ready engine** |
+
+---
+
+# 🎤 Interview Talking Points
+
+**"Why did you build a job queue from scratch?"**
+
+Because using BullMQ without understanding it means you can't debug it in production. I needed to understand why Lua scripts are used, what stall detection solves, and how concurrency works. Building it from scratch means I can explain every design decision from first principles.
+
+**"How do you prevent duplicate job processing?"**
+
+The moveToActive Lua script atomically removes a job from the waiting Sorted Set and adds it to the active Hash in a single Redis operation. Because Redis is single-threaded, no two workers can execute this script simultaneously for the same job — one will get the job, the other gets nil.
+
+**"What happens when a worker crashes mid-job?"**
+
+The Watchdog process scans the active Hash every 10 seconds looking for jobs where heartbeatAt is stale (>30s old). When it finds one, it atomically moves the job back to the waiting Sorted Set with an incremented attempt count. The job will be retried by the next available worker.
+
+**"How does rate limiting work?"**
+
+I implemented a token bucket algorithm in a Lua script. Each queue has a token count and a lastRefill timestamp in Redis. On each job pickup, the script checks if enough time has passed to refill tokens, decrements one token, and returns whether the job can proceed. The whole check-and-decrement is atomic.
+
+---
+
+# 🆕 Skills This Adds to Resume
+
+Redis Sorted Sets · Redis Pub/Sub · Lua scripting · Atomic operations · Distributed systems · Concurrency control · Stall detection · Rate limiting · Token bucket algorithm · [Socket.IO](http://Socket.IO) · Docker Compose · Horizontal scaling · Job queue architecture · ioredis · Testcontainers
+
+---
+
+# 🎯 What You Have After Phase 50
+
+- ✅ GitHub repo with clean commit history
+- ✅ Architecture diagram in README
+- ✅ 3-minute demo video on YouTube
+- ✅ Real-time dashboard showing jobs flowing through the system
+- ✅ Horizontal scaling proof: docker-compose up --scale worker=6
+- ✅ Resume bullet point ready
+- ✅ Answers to every interview question about job queues
+- ✅ Deep understanding of Redis internals that library users never have
