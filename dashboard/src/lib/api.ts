@@ -45,6 +45,8 @@ export interface JobEvent {
   progress?: number;
   error?: string;
   runAt?: number;
+  /** On job:added — true when the job went to the delayed set, not waiting */
+  delayed?: boolean;
 }
 
 /** A live event as shown in the event stream: stamped on arrival in the browser. */

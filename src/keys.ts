@@ -61,11 +61,14 @@ export function cronKey(queueName: string): string {
   return `${PREFIX}:${queueName}:cron`;
 }
 
-// Sorted set of job durations (ms). Score = duration, member = jobId.
-// Capped at 1000 entries. Used for p50/p95/p99 latency calculations.
+// List of the most recent job durations (ms), newest first, capped at
+// LATENCY_SAMPLES entries. Used for p50/p95/p99 latency calculations.
 export function latencyKey(queueName: string): string {
-  return `${PREFIX}:${queueName}:latency`;
+  return `${PREFIX}:${queueName}:latency:samples`;
 }
+
+// How many recent durations the latency list keeps.
+export const LATENCY_SAMPLES = 1000;
 
 // Simple string key. Exists = queue is paused. Workers skip polling when set.
 export function pauseKey(queueName: string): string {

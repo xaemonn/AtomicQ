@@ -50,7 +50,7 @@ export function applyEvents(prev: Record<string, Metrics>, batch: JobEvent[]): R
     if (next[e.queueName] === prev[e.queueName]) next[e.queueName] = { ...prev[e.queueName] };
     const m = next[e.queueName];
     switch (e.event) {
-      case 'job:added':     m.waiting++; break;
+      case 'job:added':     if (e.delayed) m.delayed++; else m.waiting++; break;
       case 'job:active':    m.waiting = dec(m.waiting); m.active++; break;
       case 'job:completed': m.active = dec(m.active); m.completed++; break;
       case 'job:failed':    m.active = dec(m.active); m.failed++; break;

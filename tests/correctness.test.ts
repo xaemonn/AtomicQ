@@ -12,6 +12,12 @@
  *  - addBulk() enqueues in one round-trip
  *  - DELETE /jobs/completed is not swallowed by DELETE /jobs/:id
  *  - GET /repeatables lists cron definitions
+ *  - Malformed API input gets defaults or 400, not 500
+ *  - Latency samples are the most recent ones
+ *  - A manually retried job no longer carries its old failure
+ *  - Heartbeats are refused from a worker that lost the job
+ *  - stop() keeps heartbeating while draining and finishes a claim in flight
+ *  - An id with no job data is dropped, not processed
  */
 
 import express from 'express';
@@ -21,7 +27,8 @@ import { Worker } from '../src/Worker';
 import { Scheduler } from '../src/Scheduler';
 import { createQueueRouter } from '../src/api';
 import { Job } from '../src/types';
-import { activeKey, channelKey, delayedKey, jobKey, waitingKey } from '../src/keys';
+import { activeKey, channelKey, delayedKey, jobKey, latencyKey, waitingKey, LATENCY_SAMPLES } from '../src/keys';
+import { loadScripts } from '../src/scripts';
 import { setupRedisContainer, teardownRedisContainer, TestContext } from './test-helper';
 
 const TEST_QUEUE = 'test-correctness';
@@ -246,6 +253,24 @@ describe('Lifecycle events', () => {
       sub.disconnect();
     }
   });
+
+  it('job:added says whether the job went to `delayed` or `waiting`', async () => {
+    const sub = context.redis.duplicate();
+    const events: any[] = [];
+    await sub.subscribe(channelKey(TEST_QUEUE));
+    sub.on('message', (_ch, msg) => events.push(JSON.parse(msg)));
+
+    try {
+      const later = await queue.add('later', {}, { delay: 60_000 });
+      const now = await queue.add('now', {});
+      await waitFor(async () => events.length === 2, WAIT_TIMEOUT, 'two added events');
+
+      expect(events.find(e => e.jobId === later.id)).toMatchObject({ event: 'job:added', delayed: true });
+      expect(events.find(e => e.jobId === now.id)).toMatchObject({ event: 'job:added', delayed: false });
+    } finally {
+      sub.disconnect();
+    }
+  });
 });
 
 describe('Scheduler', () => {
@@ -323,5 +348,170 @@ describe('API routing', () => {
     } finally {
       server.close();
     }
+  });
+
+  it('answers malformed input with defaults or 400, never a 500', async () => {
+    await queue.add('listed', {});
+
+    const app = express();
+    app.use(express.json());
+    app.use('/api', createQueueRouter({ [TEST_QUEUE]: queue }, context.redis));
+    const server = app.listen(0);
+    const { port } = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${port}/api/queues/${TEST_QUEUE}`;
+
+    try {
+      // Non-numeric paging falls back to the defaults
+      const page = await fetch(`${base}/jobs?status=waiting&start=abc&limit=xyz`);
+      const pageBody = await page.json();
+      expect(page.status).toBe(200);
+      expect(pageBody).toMatchObject({ start: 0, limit: 20, count: 1 });
+
+      // A POST with no JSON body is a client error
+      const noBody = await fetch(`${base}/jobs`, { method: 'POST' });
+      expect(noBody.status).toBe(400);
+      await noBody.json();
+
+      const noCleanupBody = await fetch(`${base}/cleanup`, { method: 'POST' });
+      expect(noCleanupBody.status).toBe(400);
+      await noCleanupBody.json();
+
+      const badAge = await fetch(`${base}/jobs/completed?maxAgeMs=soon`, { method: 'DELETE' });
+      expect(badAge.status).toBe(400);
+      await badAge.json();
+    } finally {
+      server.close();
+    }
+  });
+});
+
+describe('Latency samples', () => {
+  it('keeps the most recent durations, not the slowest ones', async () => {
+    const lk = latencyKey(TEST_QUEUE);
+    // A full window of slow historical samples
+    await context.redis.rpush(lk, ...Array.from({ length: LATENCY_SAMPLES }, () => 5000));
+
+    await queue.add('fast', {});
+    const worker = makeWorker(async () => {});
+    await worker.start();
+    await waitFor(async () => (await queue.getMetrics()).completed === 1, WAIT_TIMEOUT, 'completed');
+    await worker.stop();
+
+    // The new, fast sample is in; the oldest slow one made room for it
+    expect(await context.redis.llen(lk)).toBe(LATENCY_SAMPLES);
+    expect(Number(await context.redis.lindex(lk, 0))).toBeLessThan(5000);
+    expect((await queue.getMetrics()).p50).toBe(5000);
+  });
+});
+
+describe('Manual retry', () => {
+  it('clears the failure from a retried job, keeping it only as lastError', async () => {
+    const job = await queue.add('flaky', {}, { attempts: 1 });
+    let calls = 0;
+    const worker = makeWorker(async () => {
+      if (++calls === 1) throw new Error('boom');
+    });
+    await worker.start();
+    await waitFor(async () => (await queue.getMetrics()).failed === 1, WAIT_TIMEOUT, 'failed');
+    expect((await queue.getJob(job.id))?.error?.message).toBe('boom');
+
+    expect(await queue.retry(job.id)).toBe(true);
+    await waitFor(async () => (await queue.getMetrics()).completed === 1, WAIT_TIMEOUT, 'completed after retry');
+
+    const done = await queue.getJob(job.id);
+    expect(done?.status).toBe('COMPLETED');
+    expect(done?.error).toBeUndefined();
+    expect(done?.failedAt).toBeUndefined();
+    expect(await context.redis.hget(jobKey(TEST_QUEUE, job.id), 'lastError')).toContain('boom');
+  });
+});
+
+describe('Heartbeats', () => {
+  it('only the worker that owns a job can refresh its heartbeat', async () => {
+    const job = await queue.add('held', {});
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const worker = makeWorker(async () => { await gate; });
+    await worker.start();
+    await waitFor(async () => (await queue.getMetrics()).active === 1, WAIT_TIMEOUT, 'active');
+
+    try {
+      // The owner's heartbeat moves the timestamp forward
+      await context.redis.hset(activeKey(TEST_QUEUE), job.id, '1000');
+      await (worker as any).sendHeartbeats();
+      expect(Number(await context.redis.hget(activeKey(TEST_QUEUE), job.id))).toBeGreaterThan(1000);
+
+      // The job now belongs to another worker (stall-recovered and re-claimed)
+      await context.redis.hset(jobKey(TEST_QUEUE, job.id), 'lockToken', 'another-worker');
+      await context.redis.hset(activeKey(TEST_QUEUE), job.id, '1000');
+      await (worker as any).sendHeartbeats();
+      expect(await context.redis.hget(activeKey(TEST_QUEUE), job.id)).toBe('1000');
+    } finally {
+      release();
+    }
+  });
+});
+
+describe('Worker.stop()', () => {
+  it('keeps heartbeating its jobs while it drains', async () => {
+    const job = await queue.add('slow', {});
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const worker = new Worker(TEST_QUEUE, async () => { await gate; }, context.redis, { pollInterval: 100, heartbeatInterval: 100 });
+    workers.push(worker);
+    await worker.start();
+    await waitFor(async () => (await queue.getMetrics()).active === 1, WAIT_TIMEOUT, 'active');
+
+    const stopping = worker.stop(10_000);
+    // Well past several heartbeat intervals into the drain
+    await context.redis.hset(activeKey(TEST_QUEUE), job.id, '1000');
+    await new Promise(r => setTimeout(r, 500));
+    expect(Number(await context.redis.hget(activeKey(TEST_QUEUE), job.id))).toBeGreaterThan(1000);
+
+    release();
+    expect(await stopping).toBe(true);
+    expect((await queue.getJob(job.id))?.status).toBe('COMPLETED');
+  });
+
+  it('waits for a claim that was already in flight and finishes that job', async () => {
+    // A worker whose job-data read is slow: the job is claimed in Redis well
+    // before the worker has it in hand
+    const redis = context.redis.duplicate();
+    await loadScripts(redis);
+    const realHgetall = redis.hgetall.bind(redis);
+    (redis as any).hgetall = async (key: string) => {
+      await new Promise(r => setTimeout(r, 400));
+      return realHgetall(key);
+    };
+
+    try {
+      const job = await queue.add('late', {});
+      const worker = new Worker(TEST_QUEUE, async () => {}, redis, { pollInterval: 100 });
+      workers.push(worker);
+      await worker.start();
+      await waitFor(async () => (await context.redis.hexists(activeKey(TEST_QUEUE), job.id)) === 1, WAIT_TIMEOUT, 'claimed');
+
+      expect(await worker.stop(10_000)).toBe(true);
+      expect((await queue.getJob(job.id))?.status).toBe('COMPLETED');
+    } finally {
+      redis.disconnect();
+    }
+  });
+});
+
+describe('Orphaned ids', () => {
+  it('skips an id in `waiting` that has no job data, without running the processor on it', async () => {
+    await context.redis.zadd(waitingKey(TEST_QUEUE), 1, 'ghost-id');
+    const real = await queue.add('real', {});
+
+    const seen: Array<string | undefined> = [];
+    const worker = makeWorker(async (job) => { seen.push(job.name); });
+    await worker.start();
+    await waitFor(async () => (await queue.getMetrics()).completed === 1, WAIT_TIMEOUT, 'real job completed');
+
+    expect(seen).toEqual(['real']);
+    expect((await queue.getJob(real.id))?.status).toBe('COMPLETED');
+    expect(await context.redis.hexists(activeKey(TEST_QUEUE), 'ghost-id')).toBe(0);
+    expect(await context.redis.exists(jobKey(TEST_QUEUE, 'ghost-id'))).toBe(0);
   });
 });

@@ -22,6 +22,9 @@ services:
       - DISABLE_WORKERS=false
     deploy:
       replicas: 3
+    # Longer than the engine's 30s drain timeout, so `docker stop` and scale-downs
+    # let running jobs finish instead of killing them after Docker's default 10s
+    stop_grace_period: 35s
     restart: always
 
   dashboard:

@@ -136,7 +136,7 @@ export class Queue<T = any> extends EventEmitter {
 
   /**
    * Retrieves comprehensive metrics for the queue using a single pipeline call.
-   * Also computes p50/p95/p99 latency from the latency sorted set.
+   * Also computes p50/p95/p99 latency over the most recent completed jobs.
    */
   async getMetrics(): Promise<QueueMetrics> {
     const wk  = waitingKey(this.queueName);
@@ -154,19 +154,15 @@ export class Queue<T = any> extends EventEmitter {
     pipeline.zcard(ck);              // [3] Completed
     pipeline.zcard(fk);              // [4] Failed
     pipeline.zcard(cnk);             // [5] Cancelled
-    // Fetch all scores (durations) from latency sorted set — already ordered ASC
-    pipeline.zrange(lk, 0, -1, 'WITHSCORES'); // [6] latency scores
+    // Most recent durations (newest first)
+    pipeline.lrange(lk, 0, -1);      // [6] latency samples
 
     const results = await pipeline.exec();
 
     // ── Percentile calculation ────────────────────────────────────────────
     const rawLatency = (results?.[6]?.[1] as string[]) || [];
-    // WITHSCORES returns [member, score, member, score ...] — extract scores only
-    const durations: number[] = [];
-    for (let i = 1; i < rawLatency.length; i += 2) {
-      durations.push(parseFloat(rawLatency[i]));
-    }
-    // durations are already sorted ASC (Redis ZRANGE returns lowest score first)
+    // The list is in arrival order — percentiles need it sorted ASC
+    const durations = rawLatency.map(Number).filter(Number.isFinite).sort((a, b) => a - b);
     const pct = (arr: number[], p: number): number | null => {
       if (arr.length === 0) return null;
       const idx = Math.ceil((p / 100) * arr.length) - 1;

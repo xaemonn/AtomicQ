@@ -70,10 +70,13 @@ async function runBenchmark() {
           
           // Cleanup
           workers.forEach(w => w.stop());
-          redis.flushall().then(() => {
-            console.log('🧹 Redis Flushed. Benchmark Finished.\n');
-            process.exit(0);
-          });
+          // Remove only this benchmark's keys — never wipe the whole Redis server
+          redis.keys(`queue:${QUEUE_NAME}:*`)
+            .then(keys => (keys.length > 0 ? redis.del(...keys) : 0))
+            .then(() => {
+              console.log('🧹 Benchmark keys removed. Benchmark Finished.\n');
+              process.exit(0);
+            });
           resolve();
         }
       });

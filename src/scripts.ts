@@ -12,7 +12,7 @@ declare module 'ioredis' {
     moveToActive(numKeys: number, delayedKey: string, waitingKey: string, activeKey: string, limiterKey: string, channelKey: string, now: number, jobKeyPrefix: string, limitMax: number, limitDuration: number, lockToken: string, queueName: string): Promise<string | null>;
     complete(numKeys: number, jobKey: string, activeKey: string, completedKey: string, channelKey: string, jobId: string, now: number, lockToken: string, queueName: string): Promise<number>;
     fail(numKeys: number, jobKey: string, activeKey: string, delayedKey: string, failedKey: string, channelKey: string, jobId: string, errorMsg: string, now: number, nextRunAt: number, lockToken: string, queueName: string): Promise<number>;
-    heartbeat(numKeys: number, activeKey: string, jobId: string, now: number): Promise<number>;
+    heartbeat(numKeys: number, activeKey: string, jobKey: string, jobId: string, now: number, lockToken: string): Promise<number>;
     cleanStalled(numKeys: number, activeKey: string, waitingKey: string, failedKey: string, now: number, stallInterval: number, jobKeyPrefix: string): Promise<string[]>;
     updateProgress(numKeys: number, jobKey: string, progress: string): Promise<number>;
     cancel(numKeys: number, jobKey: string, activeKey: string, waitingKey: string, cancelledKey: string, delayedKey: string, jobId: string, now: number): Promise<number>;
@@ -33,8 +33,8 @@ export async function loadScripts(redis: Redis): Promise<void> {
   if (!fs.existsSync(luaDir)) {
     luaDir = path.join(__dirname, '../src/lua');
     if (!fs.existsSync(luaDir)) {
-      console.warn("⚠️ No Lua directory found at either:", path.join(__dirname, 'lua'), "or", luaDir);
-      return;
+      // Without the scripts no queue operation can work — fail at startup, not on the first job
+      throw new Error(`No Lua directory found at ${path.join(__dirname, 'lua')} or ${luaDir}`);
     }
   }
 

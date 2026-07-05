@@ -8,7 +8,7 @@
  *  2. Measures enqueue throughput (jobs/sec)
  *  3. Starts 3 workers × concurrency-5 = 15 concurrent slots
  *  4. Measures total processing time and throughput
- *  5. Prints p50 / p95 / p99 latency from Redis latency sorted set
+ *  5. Prints p50 / p95 / p99 latency over the most recent completed jobs
  *  6. Prints Redis memory usage before / during / after
  *  7. Prints bottleneck analysis
  */
@@ -17,6 +17,7 @@ import Redis from 'ioredis';
 import { Queue } from '../src/Queue';
 import { Worker } from '../src/Worker';
 import { loadScripts } from '../src/scripts';
+import { latencyKey } from '../src/keys';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -195,14 +196,8 @@ async function main() {
   // ── Phase 4: Latency Percentiles ──────────────────────────────────────────
   printHeader('Phase 4 — Latency Percentiles (from Redis)');
 
-  const lk = `queue:${QUEUE_NAME}:latency`;
-  const latencyData = await redis.zrange(lk, 0, -1, 'WITHSCORES');
-
-  // WITHSCORES returns [member, score, member, score, ...]
-  const durations: number[] = [];
-  for (let i = 1; i < latencyData.length; i += 2) {
-    durations.push(Number(latencyData[i]));
-  }
+  // The engine keeps the durations of the most recent completed jobs
+  const durations = (await redis.lrange(latencyKey(QUEUE_NAME), 0, -1)).map(Number);
   durations.sort((a, b) => a - b);
 
   if (durations.length > 0) {

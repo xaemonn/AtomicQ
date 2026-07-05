@@ -6,13 +6,11 @@ import { REDIS_URL } from "./config";
  * Uses REDIS_URL from environmental configuration.
  */
 const redis = new Redis(REDIS_URL, {
+  // Never give up: a process that stops reconnecting stays broken after Redis
+  // comes back. Wait a little longer each time, up to one attempt every 5s.
   retryStrategy(times) {
-    if (times > 10) {
-      console.error("Redis: Max retries reached. Shutting down.");
-      return null; // stop retrying
-    }
     console.log(`Redis: Reconnecting... (Attempt ${times})`);
-    return 500; // wait 500ms
+    return Math.min(times * 500, 5000);
   },
 });
 

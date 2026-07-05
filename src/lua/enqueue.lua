@@ -49,6 +49,6 @@ else
 end
 
 -- 3. Notify workers (wake-up) and the dashboard (live feed)
-redis.call("PUBLISH", KEYS[4], cjson.encode({ event = "job:added", queueName = ARGV[7], jobId = ARGV[1] }))
+redis.call("PUBLISH", KEYS[4], cjson.encode({ event = "job:added", queueName = ARGV[7], jobId = ARGV[1], delayed = isDelayed }))
 
 return ARGV[1]

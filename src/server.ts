@@ -179,7 +179,7 @@ async function main() {
     // Add HTTP health endpoint on a random port for worker
     const workerServer = require('http').createServer((req: any, res: any) => {
       if (req.url === '/health') {
-        const isRedisConnected = redis.status === 'ready' || redis.status === 'connect';
+        const isRedisConnected = redis.status === 'ready';
         if (!isRedisConnected) {
           res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ status: 'unhealthy', redisConnected: false }));

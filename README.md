@@ -17,7 +17,8 @@ Every state transition a job makes (enqueue, pick-up, complete, fail, retry, can
 - **Cron jobs** — repeatable definitions fired exactly once per occurrence, even with several schedulers running.
 - **Rate limiting** — at most `max` job starts per `durationMs`, enforced across all workers of a queue.
 - **Idempotency keys** — repeat `add()` calls with the same key within 24 h return the original job.
-- **Operations** — pause/resume, cancel, retry one or all failed jobs, history cleanup, latency percentiles, graceful shutdown.
+- **Operations** — pause/resume, cancel, retry one or all failed jobs, history cleanup, latency percentiles over the most recent 1,000 jobs, graceful shutdown.
+- **Rides out Redis outages** — the client reconnects for as long as the process lives; meanwhile the API answers `503` instead of hanging, and work resumes by itself when Redis is back.
 - **Dashboard** — React app fed by Redis Pub/Sub over Socket.IO: live pipeline counts, throughput, event stream, job inspector, workers, schedules.
 
 ## How it works

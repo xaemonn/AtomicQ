@@ -19,6 +19,14 @@ export function createQueueRouter(registry: Record<string, Queue>, redis: Redis)
 
 
 
+  // While Redis is unreachable its commands queue up behind the reconnect, which
+  // would leave every request hanging. Answer 503 straight away instead.
+  // (/health reports the same condition with its own payload.)
+  router.use((req: Request, res: Response, next) => {
+    if (req.path === '/health' || redis.status === 'ready') return next();
+    res.status(503).json({ error: 'Redis is unavailable.' });
+  });
+
   function resolveQueue(res: Response, name: string): Queue | null {
     const queue = registry[name];
     if (!queue) {
@@ -83,8 +91,9 @@ export function createQueueRouter(registry: Record<string, Queue>, redis: Redis)
     if (!queue) return;
 
     const status = String(req.query.status || 'waiting');
-    const start = Math.max(parseInt(String(req.query.start || '0')), 0);
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '20')), 1), 100);
+    // Anything that is not a number falls back to the default rather than reaching Redis as NaN
+    const start = Math.max(parseInt(String(req.query.start), 10) || 0, 0);
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit), 10) || 20, 1), 100);
     const valid = ['waiting', 'delayed', 'active', 'completed', 'failed', 'cancelled'];
 
     if (!valid.includes(status)) {
@@ -122,7 +131,8 @@ export function createQueueRouter(registry: Record<string, Queue>, redis: Redis)
     const queue = resolveQueue(res, name);
     if (!queue) return;
 
-    const { name: jobName, data, options } = req.body;
+    // req.body is undefined when the request carries no JSON body
+    const { name: jobName, data, options } = req.body ?? {};
     if (!jobName || data === undefined) {
       res.status(400).json({ error: 'Body must include: { name, data, options? }' });
       return;
@@ -158,6 +168,10 @@ export function createQueueRouter(registry: Record<string, Queue>, redis: Redis)
     const queue = resolveQueue(res, name);
     if (!queue) return;
     const maxAgeMs = req.query.maxAgeMs ? Number(req.query.maxAgeMs) : 60 * 60 * 1000;
+    if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+      res.status(400).json({ error: 'maxAgeMs must be a non-negative number of milliseconds.' });
+      return;
+    }
     try {
       const count = await queue.clearCompleted(maxAgeMs);
       res.json({ message: `Cleared ${count} completed job(s).`, count });
@@ -258,7 +272,7 @@ export function createQueueRouter(registry: Record<string, Queue>, redis: Redis)
     const queue = resolveQueue(res, name);
     if (!queue) return;
 
-    const options: CleanupOptions = { maxAge: req.body.maxAge, maxCount: req.body.maxCount };
+    const options: CleanupOptions = { maxAge: req.body?.maxAge, maxCount: req.body?.maxCount };
     if (!options.maxAge && !options.maxCount) {
       res.status(400).json({ error: 'Provide maxAge (ms) and/or maxCount.' });
       return;
@@ -323,7 +337,8 @@ export function createQueueRouter(registry: Record<string, Queue>, redis: Redis)
   router.get('/health', async (_req: Request, res: Response) => {
     try {
       // Check Redis connection
-      const isRedisConnected = redis.status === 'ready' || redis.status === 'connect';
+      // 'connect' (socket open, not yet ready) does not count: commands would still queue
+      const isRedisConnected = redis.status === 'ready';
       if (!isRedisConnected) {
         return res.status(503).json({ status: 'unhealthy', redisConnected: false });
       }

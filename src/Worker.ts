@@ -3,7 +3,7 @@ import { EventEmitter } from 'events';
 import * as os from 'os';
 import { Job, JobOptions, hydrateJob, JobStatus, WorkerOptions } from './types';
 import { randomUUID } from 'crypto';
-import { jobKey, jobKeyPrefix, waitingKey, delayedKey, activeKey, failedKey, completedKey, channelKey, limiterKey, latencyKey, pauseKey, workerKey } from './keys';
+import { jobKey, jobKeyPrefix, waitingKey, delayedKey, activeKey, failedKey, completedKey, channelKey, limiterKey, latencyKey, pauseKey, workerKey, LATENCY_SAMPLES } from './keys';
 
 /**
  * Worker class to process jobs from one or more queues.
@@ -19,6 +19,8 @@ export class Worker<T = any> extends EventEmitter {
   private pollInterval: number;
   /** Resolves the current idle wait early (job finished / job added). */
   private wakeUp?: () => void;
+  /** The running fetch loop; settles once it has exited after stop(). */
+  private loop?: Promise<void>;
   private pausedQueues: Set<string> = new Set();
 
   private activeJobs: Map<string, Job<T>> = new Map(); // jobId -> Job
@@ -78,8 +80,11 @@ export class Worker<T = any> extends EventEmitter {
        try {
           const { event, jobId } = JSON.parse(message);
           if (event === 'cancel') {
-             this.log(`⛔ Job cancellation received: ${jobId}`, channel);
-             this.cancelledJobs.add(jobId);
+             // Every worker on the queue hears every cancel; only the one running the job keeps it
+             if (this.activeJobs.has(jobId)) {
+                this.log(`⛔ Job cancellation received: ${jobId}`, channel);
+                this.cancelledJobs.add(jobId);
+             }
           } else if (event === 'job:added') {
              // Push notification: skip the rest of the idle poll interval
              this.wake();
@@ -112,7 +117,7 @@ export class Worker<T = any> extends EventEmitter {
     this.startWorkerStatusLoop(); // Phase 38
 
     // Begin the fetch loop (not awaited — runs until stop())
-    this.runLoop().catch(err => this.log(`❌ Fetch loop crashed: ${err.message}`));
+    this.loop = this.runLoop().catch(err => this.log(`❌ Fetch loop crashed: ${err.message}`));
   }
 
   /**
@@ -129,11 +134,6 @@ export class Worker<T = any> extends EventEmitter {
     this.wake();
     this.log(`🛑 Stopping worker gracefully (timeout: ${timeoutMs / 1000}s)…`);
 
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = undefined;
-    }
-
     // Phase 38: stop status loop & delete worker hash keys
     if (this.workerStatusTimer) {
       clearInterval(this.workerStatusTimer);
@@ -146,23 +146,34 @@ export class Worker<T = any> extends EventEmitter {
       this.subRedis = undefined;
     }
 
-    // Race: drain active jobs vs. hard timeout
+    // Race: drain active jobs vs. hard timeout.
+    // Job heartbeats keep running meanwhile — without them the watchdog would
+    // declare a slow job stalled mid-drain and hand it to another worker.
     let timedOut = false;
     const drainLoop = async () => {
+      // A claim that was already in flight when stop() was called still lands a job
+      await this.loop;
       while (this.activeJobsCount > 0 && !timedOut) {
         this.log(`⏳ Waiting for ${this.activeJobsCount} active job(s) to finish…`);
         await new Promise(resolve => setTimeout(resolve, 500));
       }
     };
 
-    const timeoutPromise = new Promise<void>(resolve =>
-      setTimeout(resolve, timeoutMs)
-    );
+    let timer!: NodeJS.Timeout;
+    const timeoutPromise = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, timeoutMs);
+    });
 
     await Promise.race([
       drainLoop(),
       timeoutPromise.then(() => { timedOut = true; }),
     ]);
+    clearTimeout(timer);
+
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
 
     if (timedOut) {
       this.log(`⚠️  Drain timeout reached (${timeoutMs / 1000}s). ${this.activeJobsCount} job(s) still active — forcing stop.`);
@@ -208,6 +219,8 @@ export class Worker<T = any> extends EventEmitter {
 
   /** Sleeps for up to `ms`, returning early if wake() is called. */
   private idle(ms: number): Promise<void> {
+    // stop() may have been called while a fetch was in flight — don't sleep through it
+    if (!this.running) return Promise.resolve();
     return new Promise(resolve => {
       const done = () => {
         clearTimeout(timer);
@@ -260,9 +273,9 @@ export class Worker<T = any> extends EventEmitter {
         this.currentQueueIndex = (qIdx + 1) % this.queueNames.length;
 
         const job = hydrateJob<T>(await this.redis.hgetall(jobKey(qName, jobId)));
-        if (job) return job;
-        // Orphaned ID? Just remove it
-        await this.redis.hdel(activeKey(qName), jobId);
+        if (job?.id) return job;
+        // Orphaned id (its job data is gone): drop the claim and the stub hash the claim created
+        await this.redis.pipeline().hdel(activeKey(qName), jobId).del(jobKey(qName, jobId)).exec();
       } catch (err: any) {
         this.log(`❌ Poll error on ${qName}: ${err.message}`);
       }
@@ -292,10 +305,9 @@ export class Worker<T = any> extends EventEmitter {
        return this.cancelledJobs.has(job.id);
     };
 
+    this.activeJobs.set(job.id, job);
+
     try {
-      if (job.isCancelled()) return;
-      
-      this.activeJobs.set(job.id, job);
       this.log(`🚀 Processing job [${qName}]: ${job.name} (ID: ${job.id})`);
       this.emit('active', job);
 
@@ -311,15 +323,20 @@ export class Worker<T = any> extends EventEmitter {
         return;
       }
 
-      // ── Phase 36: Record processing duration in latency sorted set ────────
-      // Score = duration ms, member = jobId. Cap at 1000 entries.
+      // The job is recorded as completed from here on: nothing below may send it
+      // down the failure path in the catch block.
       const startedAt = job.startedAt ?? finishedAt;
       const duration  = finishedAt - startedAt;
+
+      // ── Phase 36: Record processing duration ──────────────────────────────
+      // Newest first; trimming from the tail keeps the most recent samples.
       const lk = latencyKey(qName);
       const latencyPipeline = this.redis.pipeline();
-      latencyPipeline.zadd(lk, duration, job.id);    // store duration
-      latencyPipeline.zremrangebyrank(lk, 0, -1001); // keep newest 1000
-      await latencyPipeline.exec();
+      latencyPipeline.lpush(lk, duration);
+      latencyPipeline.ltrim(lk, 0, LATENCY_SAMPLES - 1);
+      await latencyPipeline.exec().catch(err => {
+        this.log(`⚠️  Could not record latency for ${job.id}: ${err.message}`, qName);
+      });
 
       // Phase 38: count completed jobs + push fresh status immediately
       this.jobsProcessed++;
@@ -374,7 +391,7 @@ export class Worker<T = any> extends EventEmitter {
 
     for (const job of this.activeJobs.values()) {
         const ak = activeKey(job.queueName);
-        promises.push(this.redis.heartbeat(1, ak, job.id, now));
+        promises.push(this.redis.heartbeat(2, ak, jobKey(job.queueName, job.id), job.id, now, this.workerId));
     }
 
     await Promise.all(promises);

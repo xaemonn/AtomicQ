@@ -14,6 +14,14 @@ end
 
 local priority = redis.call('HGET', KEYS[1], 'priority') or 5
 redis.call('HSET', KEYS[1], 'status', 'WAITING', 'attempts', '0', 'runAt', ARGV[2])
+
+-- The job is no longer failed: keep the old error only as history, so a job
+-- that succeeds on this retry is not shown with a failure it recovered from.
+local lastError = redis.call('HGET', KEYS[1], 'error')
+if lastError then
+    redis.call('HSET', KEYS[1], 'lastError', lastError)
+end
+redis.call('HDEL', KEYS[1], 'error', 'failedAt')
 redis.call('ZADD', KEYS[3], priority, ARGV[1])
 
 return 1
